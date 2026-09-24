@@ -7,8 +7,8 @@ export async function getFavicon(url) {
     const domain = new URL(url.startsWith('http') ? url : `https://${url}`).hostname;
     if (isPrivateOrReservedHost(domain)) return ''; // 拒绝内网/保留地址，防 SSRF
     const faviconUrls = [
-      `https://www.faviconextractor.com/favicon/${domain}?larger=true`,
       `https://a.favicon.im/${domain}?larger=true`,
+      `https://www.faviconextractor.com/favicon/${domain}?larger=true`,
       `https://faviconsnap.com/api/favicon?url=${domain}`,
       `https://www.google.com/s2/favicons?domain=${domain}&sz=64`,
       `https://${domain}/favicon.ico`,
