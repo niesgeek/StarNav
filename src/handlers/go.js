@@ -20,8 +20,18 @@ export async function handleGoRequest(request, env, ctx) {
     return errorResponse('Site not found', 404);
   }
 
-  const targetUrl = sanitizeUrl(site.url);
+  let targetUrl = sanitizeUrl(site.url);
   if (!targetUrl) return errorResponse('Invalid site URL', 400);
+
+  // ---------- 核心修改：追加 ?ref=nimgs.de ----------
+  try {
+    const dest = new URL(targetUrl);
+    dest.searchParams.set('ref', 'nimgs.de');
+    targetUrl = dest.toString();
+  } catch (err) {
+    // 忽略异常，保持原有 targetUrl
+  }
+  // ----------------------------------------------------
 
   const recordHit = incrementSiteHits(env, id).catch((error) => {
     console.log(`[go] failed to increment hits for site ${id}: ${error?.message || error}`);
