@@ -236,7 +236,7 @@ export async function deleteBackup(env, id) {
   if (!env?.NAV_AUTH) return { deleted: false };
   await Promise.all([
     env.NAV_AUTH.delete(`${BACKUP_PREFIX}${id}`),
-    env.NAV_AUTH.delete(`${META_PREFIX}${meta.id || id}`),
+    env.NAV_AUTH.delete(`${META_PREFIX}${id}`),
   ]);
   return { deleted: true, id };
 }
@@ -244,7 +244,6 @@ export async function deleteBackup(env, id) {
 export async function restoreBackup(env, id, { mode = 'overwrite' } = {}) {
   const payload = await getBackupPayload(env, id);
   if (!payload) throw new Error('Backup not found');
-  // 恢复前自动创建一份"恢复前快照"，跳过 WebDAV 上传以节省子请求配额与耗时
   let preRestoreSnapshot = null;
   try {
     preRestoreSnapshot = await createBackup(env, {
