@@ -1196,18 +1196,6 @@ function buildDuplicateError(duplicate, scope = 'site') {
   return error;
 }
 
-/**
- * 创建书签站点。
- *
- * 默认会进行 URL 去重校验；当 `force=true` 时允许跳过重复检查，供管理员确认覆盖风险后使用。
- *
- * @param {object} env Cloudflare Workers 环境绑定，需包含 `NAV_DB`。
- * @param {SitePayload} config 站点创建参数。
- * @param {object} [options] 创建选项。
- * @param {boolean} [options.force=false] 是否强制创建并跳过重复 URL 校验。
- * @returns {Promise<object>} D1 写入结果。
- * @throws {Error} 当必填字段缺失或 URL 重复时抛出错误。
- */
 export async function createSite(env, config, { force = false } = {}) {
   const site = normalizeSitePayload(config);
   const spaceId = null;
@@ -1231,19 +1219,6 @@ export async function createSite(env, config, { force = false } = {}) {
   return result;
 }
 
-/**
- * 更新书签站点。
- *
- * 会保留未显式传入的可见性和排序值，并默认校验 URL 是否与其他站点重复。
- *
- * @param {object} env Cloudflare Workers 环境绑定，需包含 `NAV_DB`。
- * @param {number|string} id 站点 ID。
- * @param {SitePayload} config 站点更新参数。
- * @param {object} [options] 更新选项。
- * @param {boolean} [options.force=false] 是否强制更新并跳过重复 URL 校验。
- * @returns {Promise<object>} D1 更新结果。
- * @throws {Error} 当站点不存在、必填字段缺失或 URL 重复时抛出错误。
- */
 export async function updateSite(env, id, config, { force = false } = {}) {
   const existing = await getSite(env, id);
   if (!existing) throw new Error('Site not found');
@@ -1270,13 +1245,6 @@ export async function updateSite(env, id, config, { force = false } = {}) {
   return result;
 }
 
-/**
- * 删除书签站点及其标签关联。
- *
- * @param {object} env Cloudflare Workers 环境绑定，需包含 `NAV_DB`。
- * @param {number|string} id 站点 ID。
- * @returns {Promise<object>} D1 删除结果。
- */
 export async function deleteSite(env, id) {
   await env.NAV_DB.prepare('DELETE FROM site_tags WHERE site_id = ?').bind(id).run();
   return env.NAV_DB.prepare('DELETE FROM sites WHERE id = ?').bind(id).run();
@@ -1665,7 +1633,7 @@ export async function approvePendingSite(env, id, { force = false } = {}) {
     if (duplicate) throw buildDuplicateError(duplicate, 'approve');
   }
 
-  const spaceId = null; // 批准后进入默认空空间，避免空间表异常影响审核流程
+  const spaceId = null;
   const sortOrder = await getPrependSortOrder(env, spaceId);
   const category = await upsertCategoryByName(env, config.catelog, sortOrder);
 
@@ -1736,7 +1704,6 @@ async function getExistingUrlKeySet(env) {
 export async function findDuplicateSite(env, url, { excludeId = null } = {}) {
   const key = normalizeDuplicateUrlKey(url);
   if (!key) return null;
-  // 通过 url_key 索引点查，避免全表扫描 + 全量 JS 规范化（依赖迁移已回填 url_key）。
   const row = excludeId
     ? await env.NAV_DB.prepare('SELECT id, name, url, catelog FROM sites WHERE url_key = ? AND id <> ? LIMIT 1').bind(key, Number(excludeId)).first()
     : await env.NAV_DB.prepare('SELECT id, name, url, catelog FROM sites WHERE url_key = ? LIMIT 1').bind(key).first();
@@ -1825,8 +1792,11 @@ async function restoreImportCategories(env, categories = []) {
     }))
     .filter((category) => category.name);
 
+  if (!normalized.length) return;
+
+  const insertStatements = [];
   for (const category of normalized) {
-    await env.NAV_DB.batch([
+    insertStatements.push(
       env.NAV_DB.prepare(`
         INSERT INTO categories (name, sort_order, icon, description)
         VALUES (?, ?, ?, ?)
@@ -1840,20 +1810,27 @@ async function restoreImportCategories(env, categories = []) {
         INSERT INTO category_orders (catelog, sort_order)
         VALUES (?, ?)
         ON CONFLICT(catelog) DO UPDATE SET sort_order = excluded.sort_order
-      `).bind(category.name, category.sortOrder),
-    ]);
+      `).bind(category.name, category.sortOrder)
+    );
   }
+  await env.NAV_DB.batch(insertStatements);
 
   const currentCategories = await listCategoryIdMap(env);
   const oldIdToName = new Map(normalized.map((category) => [String(category.oldId), category.name]));
+  const parentStatements = [];
   for (const category of normalized) {
     if (!category.parentId) continue;
     const parentName = oldIdToName.get(String(category.parentId));
     const parent = parentName ? currentCategories.get(parentName) : null;
     const current = currentCategories.get(category.name);
     if (parent?.id && current?.id && parent.id !== current.id) {
-      await env.NAV_DB.prepare('UPDATE categories SET parent_id = ?, update_time = CURRENT_TIMESTAMP WHERE id = ?').bind(parent.id, current.id).run();
+      parentStatements.push(
+        env.NAV_DB.prepare('UPDATE categories SET parent_id = ?, update_time = CURRENT_TIMESTAMP WHERE id = ?').bind(parent.id, current.id)
+      );
     }
+  }
+  if (parentStatements.length) {
+    await env.NAV_DB.batch(parentStatements);
   }
 }
 
@@ -1869,9 +1846,13 @@ export async function importSites(env, jsonData, { mode = 'merge' } = {}) {
 
   const existingKeys = overwrite ? new Set() : await getExistingUrlKeySet(env);
   const seenKeys = new Set();
-  let importedSites = 0;
 
   await restoreImportCategories(env, categories);
+  let categoryMap = await listCategoryIdMap(env);
+
+  const validEntries = [];
+  const missingCategoryNames = new Set();
+  const allTagNames = new Set();
 
   for (const item of sites) {
     try {
@@ -1882,21 +1863,113 @@ export async function importSites(env, jsonData, { mode = 'merge' } = {}) {
         continue;
       }
       seenKeys.add(key);
-      const spaceId = null;
-      const category = await upsertCategoryByName(env, site.catelog, site.sort_order);
-      const result = await env.NAV_DB.prepare(`
-        INSERT INTO sites (name, url, logo, desc, catelog, category_id, space_id, visibility, sort_order, url_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).bind(site.name, site.url, site.logo, site.desc, site.catelog, category?.id || null, spaceId, site.visibility, site.sort_order, key).run();
-      const siteId = result?.meta?.last_row_id;
-      if (siteId) await setSiteTags(env, siteId, site.tags);
-      importedSites += 1;
+      if (!categoryMap.has(site.catelog)) {
+        missingCategoryNames.add(site.catelog);
+      }
+      for (const tag of site.tags) {
+        if (tag) allTagNames.add(tag);
+      }
+      validEntries.push({
+        site,
+        key,
+        hits: Math.max(0, Number(item?.hits) || 0),
+        last_visit_time: nullableText(item?.last_visit_time),
+        last_checked_at: nullableText(item?.last_checked_at),
+        last_status_code: Number.isFinite(Number(item?.last_status_code)) && item?.last_status_code !== null ? Number(item.last_status_code) : null,
+        last_error: nullableText(item?.last_error),
+        create_time: nullableText(item?.create_time),
+        update_time: nullableText(item?.update_time),
+      });
     } catch (error) {
       console.log(`[import] skipped invalid site: ${error.message}`);
     }
   }
 
-  return importedSites;
+  if (!validEntries.length) return 0;
+
+  if (missingCategoryNames.size > 0) {
+    const missingCatStmts = [];
+    for (const catName of missingCategoryNames) {
+      missingCatStmts.push(
+        env.NAV_DB.prepare('INSERT OR IGNORE INTO categories (name, sort_order) VALUES (?, 9999)').bind(catName),
+        env.NAV_DB.prepare('INSERT OR IGNORE INTO category_orders (catelog, sort_order) VALUES (?, 9999)').bind(catName)
+      );
+    }
+    await env.NAV_DB.batch(missingCatStmts);
+    categoryMap = await listCategoryIdMap(env);
+  }
+
+  const CHUNK_SIZE = 80;
+  for (let i = 0; i < validEntries.length; i += CHUNK_SIZE) {
+    const chunk = validEntries.slice(i, i + CHUNK_SIZE);
+    const siteStmts = chunk.map(({ site, key, hits, last_visit_time, last_checked_at, last_status_code, last_error, create_time, update_time }) => {
+      const category = categoryMap.get(site.catelog);
+      return env.NAV_DB.prepare(`
+        INSERT INTO sites (
+          name, url, logo, desc, catelog, category_id, space_id, visibility, sort_order, url_key,
+          hits, last_visit_time, last_checked_at, last_status_code, last_error, create_time, update_time
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
+      `).bind(
+        site.name,
+        site.url,
+        site.logo,
+        site.desc,
+        site.catelog,
+        category?.id || null,
+        null,
+        site.visibility,
+        site.sort_order,
+        key,
+        hits,
+        last_visit_time,
+        last_checked_at,
+        last_status_code,
+        last_error,
+        create_time,
+        update_time || create_time
+      );
+    });
+    await env.NAV_DB.batch(siteStmts);
+  }
+
+  if (allTagNames.size > 0) {
+    const tagList = [...allTagNames];
+    for (let i = 0; i < tagList.length; i += CHUNK_SIZE) {
+      const chunk = tagList.slice(i, i + CHUNK_SIZE);
+      await env.NAV_DB.batch(
+        chunk.map((tagName) => env.NAV_DB.prepare('INSERT OR IGNORE INTO tags (name) VALUES (?)').bind(tagName))
+      );
+    }
+
+    const [{ results: tagRows }, { results: siteRows }] = await Promise.all([
+      env.NAV_DB.prepare('SELECT id, name FROM tags').all(),
+      env.NAV_DB.prepare('SELECT id, url_key FROM sites WHERE url_key IS NOT NULL').all(),
+    ]);
+
+    const tagIdMap = new Map((tagRows || []).map((row) => [row.name, row.id]));
+    const siteIdMap = new Map((siteRows || []).map((row) => [row.url_key, row.id]));
+
+    const siteTagStmts = [];
+    for (const { site, key } of validEntries) {
+      const siteId = siteIdMap.get(key);
+      if (!siteId || !site.tags.length) continue;
+      for (const tagName of site.tags) {
+        const tagId = tagIdMap.get(tagName);
+        if (tagId) {
+          siteTagStmts.push(
+            env.NAV_DB.prepare('INSERT OR IGNORE INTO site_tags (site_id, tag_id) VALUES (?, ?)').bind(siteId, tagId)
+          );
+        }
+      }
+    }
+
+    for (let i = 0; i < siteTagStmts.length; i += CHUNK_SIZE) {
+      await env.NAV_DB.batch(siteTagStmts.slice(i, i + CHUNK_SIZE));
+    }
+  }
+
+  return validEntries.length;
 }
 
 export async function exportConfig(env) {

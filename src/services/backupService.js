@@ -155,8 +155,9 @@ export async function listBackups(env) {
   let cursor;
   do {
     const page = await env.NAV_AUTH.list({ prefix: META_PREFIX, cursor });
-    for (const key of page.keys || []) {
-      const raw = await env.NAV_AUTH.get(key.name);
+    const keys = page.keys || [];
+    const raws = await Promise.all(keys.map((key) => env.NAV_AUTH.get(key.name).catch(() => null)));
+    for (const raw of raws) {
       if (!raw) continue;
       try {
         const meta = JSON.parse(raw);
@@ -183,7 +184,7 @@ async function pruneBackups(env, keep = MAX_BACKUPS) {
   return { deleted: toDelete.length };
 }
 
-export async function createBackup(env, { reason = 'manual', note = '' } = {}) {
+export async function createBackup(env, { reason = 'manual', note = '', skipWebDav = false } = {}) {
   if (!env?.NAV_AUTH) throw new Error('Backup storage (NAV_AUTH KV) is not available');
   const config = await exportConfig(env);
   const payload = JSON.stringify(config);
@@ -203,12 +204,16 @@ export async function createBackup(env, { reason = 'manual', note = '' } = {}) {
   };
   await env.NAV_AUTH.put(`${BACKUP_PREFIX}${id}`, payload);
 
-  try {
-    const webdav = await uploadBackupToWebDav(env, meta, payload);
-    meta.webdav = webdav;
-  } catch (error) {
-    meta.webdav = { uploaded: false, error: error?.message || 'WebDAV upload failed' };
-    console.log(`[backup] webdav upload failed: ${meta.webdav.error}`);
+  if (!skipWebDav) {
+    try {
+      const webdav = await uploadBackupToWebDav(env, meta, payload);
+      meta.webdav = webdav;
+    } catch (error) {
+      meta.webdav = { uploaded: false, error: error?.message || 'WebDAV upload failed' };
+      console.log(`[backup] webdav upload failed: ${meta.webdav.error}`);
+    }
+  } else {
+    meta.webdav = { skipped: true, reason: 'Skipped during pre-restore snapshot' };
   }
 
   await env.NAV_AUTH.put(`${META_PREFIX}${id}`, JSON.stringify(meta));
@@ -231,7 +236,7 @@ export async function deleteBackup(env, id) {
   if (!env?.NAV_AUTH) return { deleted: false };
   await Promise.all([
     env.NAV_AUTH.delete(`${BACKUP_PREFIX}${id}`),
-    env.NAV_AUTH.delete(`${META_PREFIX}${id}`),
+    env.NAV_AUTH.delete(`${META_PREFIX}${meta.id || id}`),
   ]);
   return { deleted: true, id };
 }
@@ -239,10 +244,14 @@ export async function deleteBackup(env, id) {
 export async function restoreBackup(env, id, { mode = 'overwrite' } = {}) {
   const payload = await getBackupPayload(env, id);
   if (!payload) throw new Error('Backup not found');
-  // 恢复前自动创建一份"恢复前快照"，防止误操作丢数据
+  // 恢复前自动创建一份"恢复前快照"，跳过 WebDAV 上传以节省子请求配额与耗时
   let preRestoreSnapshot = null;
   try {
-    preRestoreSnapshot = await createBackup(env, { reason: 'pre-restore', note: `before restore ${id}` });
+    preRestoreSnapshot = await createBackup(env, {
+      reason: 'pre-restore',
+      note: `before restore ${id}`,
+      skipWebDav: true,
+    });
   } catch (error) {
     console.log(`[backup] pre-restore snapshot failed: ${error?.message || error}`);
   }
